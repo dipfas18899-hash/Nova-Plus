@@ -1,0 +1,114 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      // Anyone authenticated can read user profiles to find people to chat/call with
+      allow read: if isAuthenticated();
+      
+      // Only the user can create or update their own profile
+      allow create: if isOwner(userId) 
+                    && hasRequiredFields(['uid', 'email', 'displayName', 'status'])
+                    && request.resource.data.uid == userId;
+                    
+      allow update: if isOwner(userId)
+                    && (!('uid' in request.resource.data) || request.resource.data.uid == userId);
+    }
+
+    // Chats Collection
+    match /chats/{chatId} {
+      // Helper to check if the user is part of this chat
+      function isParticipant() {
+        return isAuthenticated() && (
+          request.auth.uid in resource.data.participants ||
+          request.auth.uid in request.resource.data.participants
+        );
+      }
+      
+      // Participants can read and write chat metadata
+      allow read, write: if isParticipant() || (isAuthenticated() && chatId.matches('.*' + request.auth.uid + '.*'));
+
+      // Messages Subcollection
+      match /messages/{messageId} {
+        // Participants can read messages
+        allow read: if isAuthenticated() && chatId.matches('.*' + request.auth.uid + '.*');
+        
+        // Sender can create messages
+        allow create: if isAuthenticated() 
+                      && chatId.matches('.*' + request.auth.uid + '.*')
+                      && request.resource.data.senderId == request.auth.uid
+                      && hasRequiredFields(['senderId', 'receiverId', 'timestamp'])
+                      && (request.resource.data.keys().hasAny(['text', 'audioUrl']));
+      }
+    }
+
+    // Calls Collection
+    match /calls/{callId} {
+      function isCallParticipant() {
+        return isAuthenticated() && (
+          request.auth.uid == resource.data.callerId || 
+          request.auth.uid == resource.data.receiverId ||
+          request.auth.uid == request.resource.data.callerId ||
+          request.auth.uid == request.resource.data.receiverId
+        );
+      }
+
+      // Caller or receiver can read and update the call
+      allow read, update: if isCallParticipant();
+      
+      // Caller can create the call
+      allow create: if isAuthenticated() 
+                    && request.resource.data.callerId == request.auth.uid
+                    && hasRequiredFields(['callerId', 'receiverId', 'status']);
+
+      // WebRTC Signaling Subcollections
+      match /offerCandidates/{candidateId} {
+        allow read, write: if isAuthenticated() && (
+          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.callerId ||
+          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.receiverId
+        );
+      }
+      
+      match /answerCandidates/{candidateId} {
+        allow read, write: if isAuthenticated() && (
+          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.callerId ||
+          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.receiverId
+        );
+      }
+    }
+
+    // File Transfers Collection
+    match /file_transfers/{transferId} {
+      allow read, update, delete: if isAuthenticated() && (
+        request.auth.uid == resource.data.senderId || 
+        request.auth.uid == resource.data.receiverId
+      );
+      
+      allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
+
+      // WebRTC Signaling Subcollections
+      match /offerCandidates/{candidateId} {
+        allow read, write: if isAuthenticated();
+      }
+      
+      match /answerCandidates/{candidateId} {
+        allow read, write: if isAuthenticated();
+      }
+    }
+  }
+}

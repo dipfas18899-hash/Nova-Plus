@@ -1,0 +1,8 @@
+{
+  "name": "Nova Plus Chat",
+  "description": "A WhatsApp-like chat application with video and audio calls, featuring a dark glassmorphism design.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
