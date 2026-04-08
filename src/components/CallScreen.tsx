@@ -31,6 +31,7 @@ export default function CallScreen({
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [hasMultipleCameras, setHasMultipleCameras] = useState(false);
+  const [isMediaReady, setIsMediaReady] = useState(false);
   
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -105,18 +106,34 @@ export default function CallScreen({
     return () => unsubscribe();
   }, [callId, onEndCall]);
 
+  const unsubscribeCallRef = useRef<(() => void) | null>(null);
+  const unsubscribeCandidatesRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
+    let isMounted = true;
+    let stream: MediaStream | null = null;
+
     const setupMedia = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: isVideo ? { facingMode: 'user' } : false,
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: isVideo ? { 
+            facingMode: 'user',
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          } : false,
           audio: true
         });
         
+        if (!isMounted) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
         localStream.current = stream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
         }
+        setIsMediaReady(true);
 
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
@@ -124,15 +141,16 @@ export default function CallScreen({
           
           // Always show switch button on mobile devices, or if multiple cameras detected
           const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-          setHasMultipleCameras(videoInputs.length > 1 || isMobile);
+          if (isMounted) setHasMultipleCameras(videoInputs.length > 1 || isMobile);
         } catch (e) {
           console.error("Error enumerating devices", e);
         }
 
-        if (!isIncoming) {
+        if (!isIncoming && isMounted) {
           startCall();
         }
       } catch (error) {
+        if (!isMounted) return;
         console.error("Error accessing media devices:", error);
         setMediaError("Could not access camera/microphone. Please check permissions.");
         // If we can't get media, we should end the call in the database so it doesn't hang
@@ -147,25 +165,69 @@ export default function CallScreen({
     setupMedia();
 
     return () => {
-      localStream.current?.getTracks().forEach(track => track.stop());
-      peerConnection.current?.close();
+      isMounted = false;
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      if (localStream.current === stream) {
+        localStream.current = null;
+      }
+      if (peerConnection.current) {
+        peerConnection.current.close();
+        peerConnection.current = null;
+      }
+      if (unsubscribeCallRef.current) unsubscribeCallRef.current();
+      if (unsubscribeCandidatesRef.current) unsubscribeCandidatesRef.current();
     };
   }, []);
 
   const setupPeerConnection = () => {
     const pc = new RTCPeerConnection({
       iceServers: [
-        { urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
       ]
     });
 
-    localStream.current?.getTracks().forEach(track => {
-      pc.addTrack(track, localStream.current!);
-    });
+    if (localStream.current) {
+      localStream.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStream.current!);
+      });
+    }
 
     pc.ontrack = (event) => {
       if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0];
+        if (event.streams && event.streams[0]) {
+          if (remoteVideoRef.current.srcObject !== event.streams[0]) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+          }
+        } else {
+          if (!remoteVideoRef.current.srcObject) {
+            remoteVideoRef.current.srcObject = new MediaStream();
+          }
+          (remoteVideoRef.current.srcObject as MediaStream).addTrack(event.track);
+        }
+        
+        // Ensure video plays
+        const playPromise = remoteVideoRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(error => {
+            if (error.name !== 'AbortError') {
+              console.error("Auto-play was prevented:", error);
+            }
+          });
+        }
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log("ICE State:", pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed') {
+        setMediaError("Network connection failed. You may be behind a strict firewall.");
+      } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setMediaError(null);
       }
     };
 
@@ -181,6 +243,7 @@ export default function CallScreen({
 
     pc.onicecandidate = async (event) => {
       if (event.candidate) {
+        if (peerConnection.current !== pc) return;
         try {
           await addDoc(offerCandidates, event.candidate.toJSON());
         } catch (error) {
@@ -191,6 +254,8 @@ export default function CallScreen({
 
     const offerDescription = await pc.createOffer();
     await pc.setLocalDescription(offerDescription);
+
+    if (peerConnection.current !== pc) return;
 
     const offer = {
       sdp: offerDescription.sdp,
@@ -203,22 +268,43 @@ export default function CallScreen({
       handleFirestoreError(error, OperationType.WRITE, `calls/${callId}`);
     }
 
-    onSnapshot(callDoc, (snapshot) => {
+    let candidatesQueue: RTCIceCandidateInit[] = [];
+    let isRemoteDescriptionSet = false;
+    let isSettingRemoteDescription = false;
+
+    unsubscribeCallRef.current = onSnapshot(callDoc, async (snapshot) => {
       const data = snapshot.data();
-      if (!pc.currentRemoteDescription && data?.answer) {
-        setCallStatus('connected');
-        const answerDescription = new RTCSessionDescription(data.answer);
-        pc.setRemoteDescription(answerDescription);
+      if (!isRemoteDescriptionSet && !isSettingRemoteDescription && data?.answer) {
+        isSettingRemoteDescription = true;
+        try {
+          const answerDescription = new RTCSessionDescription(data.answer);
+          await pc.setRemoteDescription(answerDescription);
+          isRemoteDescriptionSet = true;
+          setCallStatus('connected');
+          
+          // Process any queued candidates now that remote description is set
+          for (const candidate of candidatesQueue) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(console.error);
+          }
+          candidatesQueue = [];
+        } catch (err) {
+          console.error("Failed to set remote description:", err);
+          isSettingRemoteDescription = false;
+        }
       }
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `calls/${callId}`);
     });
 
-    onSnapshot(answerCandidates, (snapshot) => {
+    unsubscribeCandidatesRef.current = onSnapshot(answerCandidates, (snapshot) => {
       snapshot.docChanges().forEach((change) => {
         if (change.type === 'added') {
-          const candidate = new RTCIceCandidate(change.doc.data());
-          pc.addIceCandidate(candidate);
+          const candidateData = change.doc.data() as RTCIceCandidateInit;
+          if (isRemoteDescriptionSet) {
+            pc.addIceCandidate(new RTCIceCandidate(candidateData)).catch(console.error);
+          } else {
+            candidatesQueue.push(candidateData);
+          }
         }
       });
     }, (error) => {
@@ -227,6 +313,7 @@ export default function CallScreen({
   };
 
   const answerCall = async () => {
+    if (peerConnection.current) return;
     setCallStatus('connected');
     const pc = setupPeerConnection();
     const callDoc = doc(db, 'calls', callId);
@@ -235,6 +322,7 @@ export default function CallScreen({
 
     pc.onicecandidate = async (event) => {
       if (event.candidate) {
+        if (peerConnection.current !== pc) return;
         try {
           await addDoc(answerCandidates, event.candidate.toJSON());
         } catch (error) {
@@ -243,31 +331,52 @@ export default function CallScreen({
       }
     };
 
-    try {
-      const callData = (await getDoc(callDoc)).data();
-      if (!callData?.offer) return;
+    let candidatesQueue: RTCIceCandidateInit[] = [];
+    let isRemoteDescriptionSet = false;
+    let isSettingRemoteDescription = false;
 
-      const offerDescription = new RTCSessionDescription(callData.offer);
-      await pc.setRemoteDescription(offerDescription);
+    unsubscribeCallRef.current = onSnapshot(callDoc, async (snapshot) => {
+      const callData = snapshot.data();
+      if (!isRemoteDescriptionSet && !isSettingRemoteDescription && callData?.offer) {
+        isSettingRemoteDescription = true;
+        try {
+          const offerDescription = new RTCSessionDescription(callData.offer);
+          await pc.setRemoteDescription(offerDescription);
+          isRemoteDescriptionSet = true;
 
-      const answerDescription = await pc.createAnswer();
-      await pc.setLocalDescription(answerDescription);
+          const answerDescription = await pc.createAnswer();
+          await pc.setLocalDescription(answerDescription);
 
-      const answer = {
-        type: answerDescription.type,
-        sdp: answerDescription.sdp,
-      };
+          if (peerConnection.current !== pc) return;
 
-      await updateDoc(callDoc, { answer, status: 'connected' });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `calls/${callId}`);
-    }
+          const answer = {
+            type: answerDescription.type,
+            sdp: answerDescription.sdp,
+          };
 
-    onSnapshot(offerCandidates, (snapshot) => {
+          await updateDoc(callDoc, { answer, status: 'connected' });
+          
+          // Process any candidates that arrived while we were setting up
+          for (const candidate of candidatesQueue) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(console.error);
+          }
+          candidatesQueue = [];
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, `calls/${callId}`);
+          isSettingRemoteDescription = false;
+        }
+      }
+    });
+
+    unsubscribeCandidatesRef.current = onSnapshot(offerCandidates, (snapshot) => {
       snapshot.docChanges().forEach((change) => {
         if (change.type === 'added') {
-          const candidate = new RTCIceCandidate(change.doc.data());
-          pc.addIceCandidate(candidate);
+          const candidateData = change.doc.data() as RTCIceCandidateInit;
+          if (isRemoteDescriptionSet) {
+            pc.addIceCandidate(new RTCIceCandidate(candidateData)).catch(console.error);
+          } else {
+            candidatesQueue.push(candidateData);
+          }
         }
       });
     }, (error) => {
@@ -320,12 +429,20 @@ export default function CallScreen({
       try {
         // Try exact facing mode first (best for mobile back camera)
         newStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: nextFacingMode === 'environment' ? { exact: 'environment' } : 'user' }
+          video: { 
+            facingMode: nextFacingMode === 'environment' ? { exact: 'environment' } : 'user',
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
         });
       } catch (err) {
         // Fallback to ideal facing mode if exact fails
         newStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: nextFacingMode }
+          video: { 
+            facingMode: nextFacingMode,
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
         });
       }
 
@@ -356,7 +473,11 @@ export default function CallScreen({
       // Try to recover original camera if switch failed
       try {
         const recoveryStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode }
+          video: { 
+            facingMode,
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
         });
         const recoveryTrack = recoveryStream.getVideoTracks()[0];
         localStream.current.addTrack(recoveryTrack);
@@ -371,89 +492,144 @@ export default function CallScreen({
     }
   };
 
+  const [callDuration, setCallDuration] = useState(0);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (callStatus === 'connected') {
+      interval = setInterval(() => {
+        setCallDuration(prev => prev + 1);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [callStatus]);
+
+  const formatDuration = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
   return (
     <motion.div 
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.95 }}
       transition={{ duration: 0.3, ease: "easeOut" }}
-      className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-xl flex flex-col items-center justify-center"
+      className="fixed inset-0 z-[100] bg-zinc-950 flex flex-col items-center justify-center overflow-hidden"
     >
+      {/* Blurred Background for Audio/Connecting */}
+      {(!isVideo || callStatus !== 'connected') && (
+        <div className="absolute inset-0 z-0">
+          <img src={callerPhoto} alt="Background" className="w-full h-full object-cover opacity-30 blur-3xl scale-110" />
+          <div className="absolute inset-0 bg-black/40 mix-blend-overlay"></div>
+        </div>
+      )}
+
       {mediaError && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-red-500 text-white px-4 py-2 rounded-lg z-[200] shadow-xl text-sm md:text-base text-center w-[90%] max-w-md">
+        <div className="absolute top-12 left-1/2 -translate-x-1/2 bg-red-500/90 backdrop-blur-md text-white px-6 py-3 rounded-full z-[200] shadow-2xl text-sm md:text-base text-center max-w-[90%] border border-red-400/50">
           {mediaError}
         </div>
       )}
 
-      {/* Remote Media (Always rendered for audio, hidden if not video) */}
+      {/* Remote Media */}
       <video 
         ref={remoteVideoRef} 
         autoPlay 
         playsInline 
         className={cn(
-          "absolute inset-0 w-full h-full object-cover",
-          (!isVideo || callStatus !== 'connected') ? "hidden" : ""
+          "absolute inset-0 w-full h-full object-cover transition-all duration-700 z-10",
+          (!isVideo || callStatus !== 'connected') ? "opacity-0 scale-105 pointer-events-none" : "opacity-100 scale-100"
         )}
       />
 
       {/* Local Video (PiP) */}
       {isVideo && (
-        <div className="absolute top-20 right-4 md:top-6 md:right-6 w-28 h-40 sm:w-48 sm:h-72 bg-zinc-800 rounded-2xl overflow-hidden border-2 border-glass-border shadow-2xl z-20">
+        <motion.div 
+          initial={{ opacity: 0, x: 20 }}
+          animate={{ opacity: 1, x: 0 }}
+          className="absolute top-20 right-4 md:top-8 md:right-8 w-32 h-48 sm:w-48 sm:h-72 bg-zinc-800 rounded-2xl overflow-hidden border border-white/20 shadow-[0_0_30px_rgba(255,255,255,0.1)] z-30 transition-all hover:scale-105 cursor-pointer backdrop-blur-xl"
+        >
           <video 
             ref={localVideoRef} 
             autoPlay 
             playsInline 
             muted 
-            className={cn("w-full h-full object-cover", isVideoOff && "hidden")}
+            className={cn("w-full h-full object-cover transition-opacity duration-300", isVideoOff ? "opacity-0" : "opacity-100")}
           />
           {isVideoOff && (
-            <div className="w-full h-full flex items-center justify-center bg-zinc-900">
+            <div className="absolute inset-0 flex items-center justify-center bg-zinc-900/90 backdrop-blur-sm">
               <VideoOff className="w-8 h-8 text-zinc-500" />
             </div>
           )}
-        </div>
+        </motion.div>
       )}
 
       {/* Call Info Overlay */}
       <motion.div 
         layout
         className={cn(
-          "z-10 flex flex-col items-center transition-all duration-500",
-          callStatus === 'connected' && isVideo ? "absolute top-12 left-1/2 -translate-x-1/2 scale-75 md:scale-100" : "mt-0"
+          "z-20 flex flex-col items-center transition-all duration-700 ease-in-out",
+          callStatus === 'connected' && isVideo 
+            ? "absolute top-8 left-8 items-start scale-90 origin-top-left bg-black/40 p-4 rounded-2xl backdrop-blur-md border border-white/10" 
+            : "mt-0 items-center"
         )}
       >
-        <motion.img 
-          layoutId="callerPhoto"
-          src={callerPhoto} 
-          alt={callerName} 
-          className="w-32 h-32 rounded-full object-cover border-4 border-white/10 shadow-2xl mb-6"
-        />
-        <motion.h2 layoutId="callerName" className="text-3xl font-medium text-white mb-2">{callerName}</motion.h2>
-        <p className="text-zinc-400 capitalize">
+        <motion.div layoutId="callerPhotoContainer" className="relative mb-6">
+          <div className="absolute inset-0 rounded-full bg-purple-500/30 blur-2xl animate-pulse-slow scale-150"></div>
+          <motion.img 
+            layoutId="callerPhoto"
+            src={callerPhoto} 
+            alt={callerName} 
+            className={cn(
+              "relative rounded-full object-cover border-4 border-white/20 shadow-[0_0_40px_rgba(255,255,255,0.2)] transition-all duration-700 z-10",
+              callStatus === 'connected' && isVideo ? "w-16 h-16 mb-0 border-2" : "w-36 h-36"
+            )}
+          />
+          {callStatus === 'calling' && (
+            <div className="absolute inset-0 rounded-full border-4 border-green-400/50 animate-ping z-20"></div>
+          )}
+        </motion.div>
+        
+        <motion.h2 layoutId="callerName" className={cn(
+          "font-semibold text-white tracking-tight transition-all duration-700",
+          callStatus === 'connected' && isVideo ? "text-xl mt-2" : "text-4xl mb-2"
+        )}>
+          {callerName}
+        </motion.h2>
+        
+        <p className={cn(
+          "text-zinc-300 font-medium tracking-wide transition-all duration-700",
+          callStatus === 'connected' && isVideo ? "text-sm" : "text-lg"
+        )}>
           {callStatus === 'incoming' ? 'Incoming call...' : 
            callStatus === 'calling' ? 'Calling...' : 
-           'Connected'}
+           formatDuration(callDuration)}
         </p>
       </motion.div>
 
       {/* Controls */}
       <motion.div 
-        initial={{ y: 50, opacity: 0 }}
+        initial={{ y: 100, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
-        transition={{ delay: 0.2 }}
-        className="absolute bottom-10 md:bottom-12 left-1/2 -translate-x-1/2 flex items-center gap-4 md:gap-6 z-20 bg-black/40 p-3 md:p-4 rounded-full backdrop-blur-md border border-white/10"
+        transition={{ delay: 0.3, type: "spring", stiffness: 200, damping: 20 }}
+        className="absolute bottom-12 left-1/2 -translate-x-1/2 flex items-center gap-4 md:gap-6 z-30 bg-white/10 p-4 md:p-5 rounded-[2.5rem] backdrop-blur-3xl border border-white/20 shadow-[0_8px_32px_0_rgba(255,255,255,0.1)]"
       >
         {callStatus === 'incoming' ? (
           <>
             <button 
               onClick={handleEndCall}
-              className="w-16 h-16 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center text-white transition-transform hover:scale-105 active:scale-95 shadow-lg shadow-red-500/20"
+              className="w-16 h-16 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center text-white transition-all hover:scale-110 active:scale-95 shadow-lg shadow-red-500/30"
             >
               <PhoneOff className="w-7 h-7" />
             </button>
             <button 
               onClick={answerCall}
-              className="w-16 h-16 rounded-full bg-green-500 hover:bg-green-600 flex items-center justify-center text-white transition-transform hover:scale-105 active:scale-95 shadow-lg shadow-green-500/20"
+              disabled={!isMediaReady}
+              className={cn(
+                "w-16 h-16 rounded-full flex items-center justify-center text-white transition-all shadow-lg",
+                isMediaReady ? "bg-green-500 hover:bg-green-600 hover:scale-110 active:scale-95 shadow-green-500/30 animate-bounce" : "bg-green-500/40 cursor-not-allowed"
+              )}
             >
               {isVideo ? <VideoIcon className="w-7 h-7" /> : <PhoneOff className="w-7 h-7 rotate-[135deg]" />}
             </button>
@@ -463,8 +639,8 @@ export default function CallScreen({
             <button 
               onClick={toggleMute}
               className={cn(
-                "w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-105 active:scale-95",
-                isMuted ? "bg-white text-black" : "bg-white/10 text-white hover:bg-white/20 backdrop-blur-md border border-white/10"
+                "w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-110 active:scale-95",
+                isMuted ? "bg-white text-black shadow-lg shadow-white/20" : "bg-white/10 text-white hover:bg-white/20 border border-white/10"
               )}
             >
               {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
@@ -474,8 +650,8 @@ export default function CallScreen({
               <button 
                 onClick={toggleVideo}
                 className={cn(
-                  "w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-105 active:scale-95",
-                  isVideoOff ? "bg-white text-black" : "bg-white/10 text-white hover:bg-white/20 backdrop-blur-md border border-white/10"
+                  "w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-110 active:scale-95",
+                  isVideoOff ? "bg-white text-black shadow-lg shadow-white/20" : "bg-white/10 text-white hover:bg-white/20 border border-white/10"
                 )}
               >
                 {isVideoOff ? <VideoOff className="w-6 h-6" /> : <VideoIcon className="w-6 h-6" />}
@@ -485,16 +661,18 @@ export default function CallScreen({
             {isVideo && hasMultipleCameras && (
               <button 
                 onClick={handleSwitchCamera}
-                className="w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-105 active:scale-95 bg-white/10 text-white hover:bg-white/20 backdrop-blur-md border border-white/10"
+                className="w-14 h-14 rounded-full flex items-center justify-center transition-all hover:scale-110 active:scale-95 bg-white/10 text-white hover:bg-white/20 border border-white/10"
                 title="Switch Camera"
               >
                 <SwitchCamera className="w-6 h-6" />
               </button>
             )}
 
+            <div className="w-px h-8 bg-white/20 mx-2"></div>
+
             <button 
               onClick={handleEndCall}
-              className="w-16 h-16 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center text-white transition-transform hover:scale-105 active:scale-95 shadow-lg shadow-red-500/20"
+              className="w-16 h-16 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center text-white transition-all hover:scale-110 active:scale-95 shadow-lg shadow-red-500/30"
             >
               <PhoneOff className="w-7 h-7" />
             </button>

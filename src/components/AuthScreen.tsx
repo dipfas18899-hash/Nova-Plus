@@ -49,17 +49,13 @@ export default function AuthScreen() {
   };
 
   return (
-    <div className="min-h-[100dvh] flex items-center justify-center p-4 md:p-8">
-      <div className="glass-panel w-full max-w-md rounded-3xl p-6 md:p-8 flex flex-col gap-6 relative overflow-hidden">
-        {/* Decorative elements */}
-        <div className="absolute -top-20 -right-20 w-40 h-40 bg-blue-500/20 rounded-full blur-3xl"></div>
-        <div className="absolute -bottom-20 -left-20 w-40 h-40 bg-purple-500/20 rounded-full blur-3xl"></div>
-        
+    <div className="min-h-[100dvh] flex items-center justify-center p-4 md:p-8 relative z-10">
+      <div className="glass-panel w-full max-w-md rounded-[2.5rem] p-8 md:p-10 flex flex-col gap-8 relative overflow-hidden shadow-[0_0_40px_rgba(168,85,247,0.15)] border-white/10 bg-white/5 backdrop-blur-3xl">
         <div className="text-center z-10">
-          <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
+          <h1 className="text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 animate-gradient-x tracking-tight">
             Nova Plus
           </h1>
-          <p className="text-zinc-400 mt-2 text-sm">
+          <p className="text-zinc-400 mt-3 text-sm font-medium">
             {isLogin ? 'Welcome back to the future of chat' : 'Join the future of chat'}
           </p>
         </div>

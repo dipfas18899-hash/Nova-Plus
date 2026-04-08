@@ -34,14 +34,13 @@ service cloud.firestore {
     match /chats/{chatId} {
       // Helper to check if the user is part of this chat
       function isParticipant() {
-        return isAuthenticated() && (
-          request.auth.uid in resource.data.participants ||
-          request.auth.uid in request.resource.data.participants
-        );
+        let isExistingParticipant = resource != null && 'participants' in resource.data && request.auth.uid in resource.data.participants;
+        let isNewParticipant = request.resource != null && 'participants' in request.resource.data && request.auth.uid in request.resource.data.participants;
+        return isAuthenticated() && (isExistingParticipant || isNewParticipant || chatId.matches('.*' + request.auth.uid + '.*'));
       }
       
       // Participants can read and write chat metadata
-      allow read, write: if isParticipant() || (isAuthenticated() && chatId.matches('.*' + request.auth.uid + '.*'));
+      allow read, write: if isParticipant();
 
       // Messages Subcollection
       match /messages/{messageId} {
@@ -53,19 +52,16 @@ service cloud.firestore {
                       && chatId.matches('.*' + request.auth.uid + '.*')
                       && request.resource.data.senderId == request.auth.uid
                       && hasRequiredFields(['senderId', 'receiverId', 'timestamp'])
-                      && (request.resource.data.keys().hasAny(['text', 'audioUrl']));
+                      && (request.resource.data.keys().hasAny(['text', 'audioUrl', 'gifUrl']));
       }
     }
 
     // Calls Collection
     match /calls/{callId} {
       function isCallParticipant() {
-        return isAuthenticated() && (
-          request.auth.uid == resource.data.callerId || 
-          request.auth.uid == resource.data.receiverId ||
-          request.auth.uid == request.resource.data.callerId ||
-          request.auth.uid == request.resource.data.receiverId
-        );
+        let isExistingParticipant = resource != null && (request.auth.uid == resource.data.callerId || request.auth.uid == resource.data.receiverId);
+        let isNewParticipant = request.resource != null && (request.auth.uid == request.resource.data.callerId || request.auth.uid == request.resource.data.receiverId);
+        return isAuthenticated() && (isExistingParticipant || isNewParticipant);
       }
 
       // Caller or receiver can read and update the call
@@ -78,17 +74,11 @@ service cloud.firestore {
 
       // WebRTC Signaling Subcollections
       match /offerCandidates/{candidateId} {
-        allow read, write: if isAuthenticated() && (
-          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.callerId ||
-          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.receiverId
-        );
+        allow read, write: if isAuthenticated();
       }
       
       match /answerCandidates/{candidateId} {
-        allow read, write: if isAuthenticated() && (
-          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.callerId ||
-          request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.receiverId
-        );
+        allow read, write: if isAuthenticated();
       }
     }
 

@@ -3,11 +3,12 @@ import { useAuth } from '../contexts/AuthContext';
 import { auth, db } from '../firebase';
 import { signOut } from 'firebase/auth';
 import { collection, query, where, onSnapshot, orderBy, doc, setDoc, serverTimestamp, getDocs, addDoc, updateDoc } from 'firebase/firestore';
-import { LogOut, Search, Phone, Video, MoreVertical, Send, User as UserIcon, ChevronLeft, Mic, Square, Paperclip, Bell, BellOff } from 'lucide-react';
+import { LogOut, Search, Phone, Video, MoreVertical, Send, User as UserIcon, ChevronLeft, Mic, Square, Paperclip, Bell, BellOff, Maximize, Minimize, Smile } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { format } from 'date-fns';
 import CallScreen from './CallScreen';
 import FileTransfer from './FileTransfer';
+import GifPicker from './GifPicker';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -30,6 +31,9 @@ export default function MainLayout() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   
+  // GIF state
+  const [showGifPicker, setShowGifPicker] = useState(false);
+  
   // Call state
   const [activeCall, setActiveCall] = useState<any | null>(null);
 
@@ -43,6 +47,36 @@ export default function MainLayout() {
   const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
     "Notification" in window ? Notification.permission : "default"
   );
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(err => {
+        console.error(`Error attempting to enable fullscreen: ${err.message}`);
+      });
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    }
+  };
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -98,7 +132,7 @@ export default function MainLayout() {
               body,
               icon: '/vite.svg',
               vibrate: [200, 100, 200]
-            });
+            } as any);
             return; // If successful, don't show toast
           }
         }
@@ -206,13 +240,14 @@ export default function MainLayout() {
     const q = query(
       collection(db, 'calls'), 
       where('receiverId', '==', user.uid),
-      where('status', '==', 'calling')
+      where('status', 'in', ['calling', 'connected'])
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       snapshot.docChanges().forEach((change) => {
+        const callData = change.doc.data();
+        
         if (change.type === 'added') {
-          const callData = change.doc.data();
           // Find caller details
           const caller = users.find(u => u.uid === callData.callerId);
           if (caller) {
@@ -233,6 +268,16 @@ export default function MainLayout() {
               );
             }
           }
+        }
+        
+        if (change.type === 'modified') {
+          if (callData.status === 'ended' || callData.status === 'rejected') {
+            setActiveCall(null);
+          }
+        }
+        
+        if (change.type === 'removed') {
+          setActiveCall(null);
         }
       });
     }, (error) => {
@@ -430,6 +475,31 @@ export default function MainLayout() {
     }
   };
 
+  const sendGifMessage = async (gifUrl: string) => {
+    if (!user || !selectedUser) return;
+    const chatId = [user.uid, selectedUser.uid].sort().join('_');
+    
+    try {
+      const messageRef = doc(collection(db, 'chats', chatId, 'messages'));
+      await setDoc(messageRef, {
+        type: 'gif',
+        gifUrl: gifUrl,
+        senderId: user.uid,
+        receiverId: selectedUser.uid,
+        timestamp: serverTimestamp(),
+      });
+
+      await setDoc(doc(db, 'chats', chatId), {
+        lastMessage: 'GIF',
+        lastMessageTime: serverTimestamp(),
+        participants: [user.uid, selectedUser.uid],
+        lastMessageSenderId: user.uid
+      }, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `chats/${chatId}`);
+    }
+  };
+
   const initiateCall = async (isVideo: boolean, targetUser: any = selectedUser) => {
     if (!user || !targetUser) return;
 
@@ -540,11 +610,11 @@ export default function MainLayout() {
 
       {/* Sidebar */}
       <div className={cn(
-        "w-full md:w-80 glass-panel rounded-none md:rounded-3xl flex flex-col overflow-hidden shrink-0 border-0 md:border border-glass-border",
+        "w-full md:w-80 glass-panel rounded-none md:rounded-[2.5rem] flex flex-col overflow-hidden shrink-0 border-0 md:border border-white/10 bg-white/5 backdrop-blur-3xl shadow-[0_0_40px_rgba(0,0,0,0.3)] z-10",
         selectedUser ? "hidden md:flex" : "flex"
       )}>
         {/* Header */}
-        <div className="p-4 border-b border-glass-border flex items-center justify-between bg-black/20">
+        <div className="p-4 border-b border-white/10 flex items-center justify-between bg-black/20 backdrop-blur-md">
           <div className="flex items-center gap-3">
             <img 
               src={user?.photoURL || ''} 
@@ -557,6 +627,13 @@ export default function MainLayout() {
             </div>
           </div>
           <div className="flex items-center gap-1">
+            <button 
+              onClick={toggleFullscreen}
+              className="p-2 rounded-full transition-colors text-zinc-400 hover:text-white hover:bg-white/10"
+              title={isFullscreen ? "Exit Fullscreen" : "Fullscreen"}
+            >
+              {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+            </button>
             <button 
               onClick={requestNotificationPermission}
               className={cn(
@@ -653,7 +730,7 @@ export default function MainLayout() {
 
       {/* Main Chat Area */}
       <div className={cn(
-        "flex-1 glass-panel rounded-none md:rounded-3xl flex flex-col overflow-hidden relative border-0 md:border border-glass-border",
+        "flex-1 glass-panel rounded-none md:rounded-[2.5rem] flex flex-col overflow-hidden relative border-0 md:border border-white/10 bg-white/5 backdrop-blur-3xl shadow-[0_0_40px_rgba(0,0,0,0.3)] z-10",
         !selectedUser ? "hidden md:flex" : "flex"
       )}>
         <AnimatePresence mode="wait">
@@ -667,7 +744,7 @@ export default function MainLayout() {
               className="flex-1 flex flex-col h-full"
             >
               {/* Chat Header */}
-            <div className="p-3 md:p-4 border-b border-glass-border flex items-center justify-between bg-black/20 backdrop-blur-md z-10">
+            <div className="p-3 md:p-4 border-b border-white/10 flex items-center justify-between bg-black/20 backdrop-blur-md z-10">
               <div className="flex items-center gap-2 md:gap-3">
                 <button 
                   onClick={() => setSelectedUser(null)}
@@ -755,10 +832,10 @@ export default function MainLayout() {
                         <div className="w-8 shrink-0"></div>
                       )}
                       <div className={cn(
-                        "p-3 rounded-2xl relative group",
+                        "p-3 rounded-[1.25rem] relative group shadow-lg backdrop-blur-md",
                         isMe 
-                          ? "bg-gradient-to-br from-blue-600 to-purple-600 text-white rounded-br-sm" 
-                          : "bg-white/10 border border-glass-border text-zinc-100 rounded-bl-sm"
+                          ? "bg-gradient-to-r from-blue-600 via-purple-600 to-blue-600 bg-[length:200%_auto] animate-gradient-x text-white rounded-br-sm border border-white/20 shadow-purple-500/20" 
+                          : "bg-white/10 border border-white/10 text-zinc-100 rounded-bl-sm shadow-black/20"
                       )}>
                         {msg.type === 'audio' ? (
                           <audio controls src={msg.audioUrl} className="max-w-[200px] md:max-w-[250px] h-10" />
@@ -772,6 +849,8 @@ export default function MainLayout() {
                             <Paperclip className="w-4 h-4" />
                             <p className="text-sm font-medium">{msg.text}</p>
                           </div>
+                        ) : msg.type === 'gif' ? (
+                          <img src={msg.gifUrl} alt="GIF" className="max-w-[200px] md:max-w-[250px] rounded-lg" />
                         ) : (
                           <p className="text-sm">{msg.text}</p>
                         )}
@@ -791,11 +870,18 @@ export default function MainLayout() {
                   <p>Say hello to {getDisplayName(activeSelectedUser)}!</p>
                 </div>
               )}
+              <div ref={messagesEndRef} />
             </div>
 
             {/* Input Area */}
-            <div className="p-4 bg-black/20 border-t border-glass-border backdrop-blur-md">
-              <form onSubmit={handleSendMessage} className="flex items-center gap-2">
+            <div className="p-2 sm:p-4 bg-black/20 border-t border-white/10 backdrop-blur-md relative z-10">
+              {showGifPicker && (
+                <GifPicker 
+                  onSelect={sendGifMessage} 
+                  onClose={() => setShowGifPicker(false)} 
+                />
+              )}
+              <form onSubmit={handleSendMessage} className="flex items-center gap-1 sm:gap-2">
                 <input 
                   type="file" 
                   ref={fileInputRef} 
@@ -805,10 +891,21 @@ export default function MainLayout() {
                 <button 
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="p-3 rounded-full text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
+                  className="p-2 sm:p-3 rounded-full text-zinc-400 hover:text-white hover:bg-white/10 transition-colors shrink-0"
                   title="Send File Directly (P2P)"
                 >
                   <Paperclip className="w-5 h-5" />
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setShowGifPicker(!showGifPicker)}
+                  className={cn(
+                    "p-2 sm:p-3 rounded-full transition-colors shrink-0",
+                    showGifPicker ? "text-blue-400 bg-white/10" : "text-zinc-400 hover:text-white hover:bg-white/10"
+                  )}
+                  title="Send GIF"
+                >
+                  <Smile className="w-5 h-5" />
                 </button>
                 <input
                   type="text"
@@ -820,15 +917,16 @@ export default function MainLayout() {
                     }
                     setNewMessage(val);
                   }}
-                  placeholder={isRecording ? "Recording audio..." : "Type a message..."}
+                  onFocus={() => setShowGifPicker(false)}
+                  placeholder={isRecording ? "Recording..." : "Type a message..."}
                   disabled={isRecording}
-                  className="glass-input flex-1 py-3 px-4 rounded-full text-sm disabled:opacity-50"
+                  className="glass-input flex-1 min-w-0 py-2 sm:py-3 px-3 sm:px-4 rounded-full text-sm disabled:opacity-50"
                 />
                 <button 
                   type="button"
                   onClick={isRecording ? stopRecording : startRecording}
                   className={cn(
-                    "p-3 rounded-full text-white transition-all hover:scale-105 active:scale-95",
+                    "p-2 sm:p-3 rounded-full text-white transition-all hover:scale-105 active:scale-95 shrink-0",
                     isRecording ? "bg-red-500 animate-pulse" : "bg-zinc-800 hover:bg-zinc-700"
                   )}
                 >
@@ -837,7 +935,7 @@ export default function MainLayout() {
                 <button 
                   type="submit"
                   disabled={!newMessage.trim() || isRecording}
-                  className="p-3 bg-gradient-to-r from-blue-500 to-purple-500 rounded-full text-white disabled:opacity-50 transition-all hover:scale-105 active:scale-95"
+                  className="p-2 sm:p-3 bg-gradient-to-r from-blue-500 to-purple-500 rounded-full text-white disabled:opacity-50 transition-all hover:scale-105 active:scale-95 shrink-0"
                 >
                   <Send className="w-5 h-5 ml-0.5" />
                 </button>
